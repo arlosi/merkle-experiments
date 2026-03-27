@@ -1,2 +1,4 @@
 /target
 /store*
+/merkletree/target
+/merklecli/target

@@ -5,14 +5,16 @@ use std::{
 
 use tracing::trace;
 
-use crate::{Hash, ObjectStore, Result};
+use crate::{GCObjectStore, Hash, ReadObjectStore, WriteObjectStore};
 
 pub struct FsStore {
     root: PathBuf,
 }
 
+type IoResult<T> = std::result::Result<T, std::io::Error>;
+
 impl FsStore {
-    pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+    pub fn new(root: impl AsRef<Path>) -> IoResult<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(root.join("objects"))?;
         std::fs::create_dir_all(root.join("data"))?;
@@ -28,8 +30,24 @@ impl FsStore {
     }
 }
 
-impl ObjectStore for FsStore {
-    async fn write(&self, hash: &Hash, data: &[u8], is_leaf: bool) -> Result<()> {
+impl ReadObjectStore for FsStore {
+    type E = std::io::Error;
+
+    async fn read(&self, hash: &str, is_leaf: bool) -> IoResult<Option<Vec<u8>>> {
+        let path = self.object_path(&hash, is_leaf);
+        trace!("Reading object {}", path.display());
+        let data = match std::fs::read(&path) {
+            Ok(data) => Some(data),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+
+        Ok(data)
+    }
+}
+
+impl WriteObjectStore for FsStore {
+    async fn write(&self, hash: &Hash, data: &[u8], is_leaf: bool) -> IoResult<()> {
         let path = self.object_path(&hash.0, is_leaf);
         std::fs::create_dir_all(path.parent().unwrap())?;
         if !path.exists() {
@@ -37,22 +55,16 @@ impl ObjectStore for FsStore {
         }
         Ok(())
     }
+}
 
-    async fn read(&self, hash: &Hash, is_leaf: bool) -> Result<Vec<u8>> {
-        let path = self.object_path(&hash.0, is_leaf);
-        trace!("Reading object {}", path.display());
-        let data = std::fs::read(&path)?;
-
-        Ok(data)
-    }
-
-    async fn delete(&self, hash: &Hash, is_leaf: bool) -> Result<()> {
+impl GCObjectStore for FsStore {
+    async fn delete(&self, hash: &Hash, is_leaf: bool) -> IoResult<()> {
         let path = self.object_path(&hash.0, is_leaf);
         std::fs::remove_file(&path)?;
         Ok(())
     }
 
-    async fn enumerate_all(&self) -> Result<HashSet<(Hash, bool)>> {
+    async fn enumerate_all(&self) -> IoResult<HashSet<(Hash, bool)>> {
         let mut all = HashSet::new();
         let objects_dir = self.root.join("objects");
         for entry in std::fs::read_dir(objects_dir)? {
@@ -75,17 +87,6 @@ impl ObjectStore for FsStore {
             }
         }
         Ok(all)
-    }
-
-    fn load_index(&self) -> Result<Option<Hash>> {
-        let path = self.root.join("index.json");
-        Ok(std::fs::read_to_string(&path).ok().map(Hash))
-    }
-
-    fn save_index(&self, root_hash: &Hash) -> Result<()> {
-        let path = self.root.join("index.json");
-        std::fs::write(&path, &root_hash.0)?;
-        Ok(())
     }
 }
 
@@ -126,7 +127,7 @@ mod tests {
 
         block_on(async {
             store.write(&hash, data, true).await.unwrap();
-            let read_data = store.read(&hash, true).await.unwrap();
+            let read_data = store.read(&hash.0, true).await.unwrap().unwrap();
             assert_eq!(read_data, data);
         });
     }
@@ -140,7 +141,7 @@ mod tests {
 
         block_on(async {
             store.write(&hash, data, false).await.unwrap();
-            let read_data = store.read(&hash, false).await.unwrap();
+            let read_data = store.read(&hash.0, false).await.unwrap().unwrap();
             assert_eq!(read_data, data);
         });
     }
@@ -154,12 +155,12 @@ mod tests {
 
         block_on(async {
             store.write(&hash, data, true).await.unwrap();
-            let read_data = store.read(&hash, true).await.unwrap();
+            let read_data = store.read(&hash.0, true).await.unwrap().unwrap();
             assert_eq!(read_data, data);
 
             store.delete(&hash, true).await.unwrap();
-            let result = store.read(&hash, true).await;
-            assert!(result.is_err());
+            let result = store.read(&hash.0, true).await.unwrap();
+            assert!(result.is_none());
         });
     }
 
@@ -181,24 +182,6 @@ mod tests {
             assert!(all.contains(&(hash1.clone(), true)));
             assert!(all.contains(&(hash2.clone(), false)));
         });
-    }
-
-    #[test]
-    fn test_load_save_index() {
-        let temp = temp_dir();
-        let store = FsStore::new(&temp).unwrap();
-        let hash = Hash("root_hash".to_string());
-
-        // Initially no index
-        let loaded = store.load_index().unwrap();
-        assert!(loaded.is_none());
-
-        // Save index
-        store.save_index(&hash).unwrap();
-
-        // Load index
-        let loaded = store.load_index().unwrap();
-        assert_eq!(loaded, Some(hash));
     }
 
     #[test]

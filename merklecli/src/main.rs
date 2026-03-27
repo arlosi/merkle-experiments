@@ -1,15 +1,12 @@
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use futures::{StreamExt as _, stream::FuturesUnordered};
-use merkletree::{ObjectStore, Store, fsstore::FsStore, memstore::CacheStore};
-use serde::Deserialize;
-use tracing::info;
+use merkletree::{MerkleStore, fsstore::FsStore};
 use tracing_subscriber::EnvFilter;
 use walkdir::{DirEntry, WalkDir};
 mod server;
@@ -40,8 +37,6 @@ enum Cmd {
     Get { logical_name: String },
     /// Collect garbage
     Gc,
-    /// Perform fake dep resolution
-    Resolve { name: String },
 
     /// Start sparse protocol server
     Serve {
@@ -89,14 +84,15 @@ async fn main() -> anyhow::Result<()> {
         240000 / bin_count
     );
 
-    let backend = FsStore::new("store")?;
-    let cache = CacheStore::new(backend);
-    let mut store = Store::new(cache, cli.tree_depth, cli.tree_bredth);
-    store.load()?;
+    let backend = FsStore::new(&cli.path)?;
+    let mut store = MerkleStore::new(backend);
+    let root_path = cli.path.join("index.json");
+    let root = std::fs::read_to_string(&root_path).ok();
+    store.configure(root.as_deref(), cli.tree_depth, cli.tree_bredth).await;
 
     match cli.cmd {
         Cmd::Serve { port, key, cert } => {
-            server::serve(store, port, &cert, &key).await?;
+            server::serve(store, port, &cert, &key, (cli.tree_depth, cli.tree_bredth)).await?;
             return Ok(());
         }
 
@@ -115,20 +111,21 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Gc => {
             store.gc().await?;
         }
-        Cmd::Resolve { name } => worst_resolver_ever(&store, &name).await,
     }
 
-    store.save()?;
+    if let Some(root) = store.root().await {
+        std::fs::write(root_path, root)?;
+    }
 
     Ok(())
 }
 
-async fn overwrite_with<T: ObjectStore>(
-    store: &mut Store<T>,
+async fn overwrite_with(
+    store: &mut MerkleStore<FsStore>,
     path: &Path,
 ) -> Result<(), anyhow::Error> {
     let walker = WalkDir::new(path).into_iter();
-    let mut files = Vec::new();
+    let mut files = HashMap::new();
     for entry in walker.filter_entry(|e| !is_hidden(e)) {
         let entry = entry?;
         let path = entry.path();
@@ -136,62 +133,9 @@ async fn overwrite_with<T: ObjectStore>(
             continue;
         }
         let logical_name = entry.file_name().to_str().unwrap();
-        files.push((logical_name.to_string(), path.to_path_buf()));
+        files.insert(logical_name.to_string(), path.to_path_buf());
     }
-    store.overwrite(&files).await?;
+    store.overwrite(files.keys(), |p| Ok(std::fs::read(p)?)).await?;
 
     Ok(())
-}
-
-#[derive(Deserialize)]
-struct Dependency {
-    name: String,
-    package: Option<String>,
-    kind: String,
-    optional: bool,
-}
-
-#[derive(Deserialize)]
-struct Crate {
-    deps: Vec<Dependency>,
-}
-
-async fn worst_resolver_ever<T: ObjectStore>(store: &Store<T>, name: &str) {
-    let mut inflight = FuturesUnordered::new();
-    let mut resolved = HashSet::new();
-
-    resolved.insert(name.to_string());
-    inflight.push(resolve_one(store, name.to_string()));
-
-    while let Some(deps) = inflight.next().await {
-        for dep in deps {
-            if resolved.insert(dep.clone()) {
-                println!("resolving {}", dep);
-                inflight.push(resolve_one(store, dep));
-            }
-        }
-    }
-}
-
-// Get name -> dependencies
-async fn resolve_one<T: ObjectStore>(store: &Store<T>, name: String) -> Vec<String> {
-    info!("resolving {}", name);
-
-    let bytes = store
-        .get_file(&name)
-        .await
-        .expect("store error")
-        .expect("file missing");
-
-    let text = String::from_utf8(bytes).expect("invalid utf8");
-    let last_line = text.lines().last().expect("empty file");
-
-    let krate: Crate = serde_json::from_str(last_line).expect("invalid json");
-
-    krate
-        .deps
-        .into_iter()
-        .filter(|dep| dep.kind != "dev" && !dep.optional)
-        .map(|dep| dep.package.unwrap_or(dep.name))
-        .collect()
 }
