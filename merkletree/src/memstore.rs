@@ -1,5 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet}, convert::Infallible, sync::{Mutex}
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    sync::Mutex,
 };
 
 use crate::{GCObjectStore, Hash, ReadObjectStore, WriteObjectStore};
@@ -32,24 +34,24 @@ impl ReadObjectStore for MemoryStore {
 }
 
 impl WriteObjectStore for MemoryStore {
-    async fn write(&self, hash: &Hash, data: &[u8], is_leaf: bool) -> Result<(), Self::E> {
+    async fn write(&self, hash: &str, data: Vec<u8>, is_leaf: bool) -> Result<(), Self::E> {
         let mut objs = self.objects.lock().unwrap();
-        objs.entry((hash.clone(), is_leaf))
-            .or_insert_with(|| data.to_vec());
+        objs.entry((Hash(hash.to_string()), is_leaf))
+            .or_insert_with(|| data);
         Ok(())
     }
 }
 
 impl GCObjectStore for MemoryStore {
-    async fn delete(&self, hash: &Hash, is_leaf: bool) -> Result<(), Self::E> {
+    async fn delete(&self, hash: &str, is_leaf: bool) -> Result<(), Self::E> {
         let mut objs = self.objects.lock().unwrap();
-        objs.remove(&(hash.clone(), is_leaf));
+        objs.remove(&(Hash(hash.to_string()), is_leaf));
         Ok(())
     }
 
-    async fn enumerate_all(&self) -> Result<HashSet<(Hash, bool)>, Self::E> {
+    async fn enumerate_all(&self) -> Result<HashSet<(String, bool)>, Self::E> {
         let objs = self.objects.lock().unwrap();
-        Ok(objs.keys().cloned().collect())
+        Ok(objs.keys().map(|(a, b)| (a.0.clone(), *b)).collect())
     }
 }
 
@@ -60,11 +62,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_memory_store(){
+    fn test_memory_store() {
         futures::executor::block_on(async {
             let mut store = MerkleStore::new(MemoryStore::new());
             store.configure(None, 2, 4).await;
-            store.put_object("test", b"hello world").await.unwrap();
+            store
+                .put_object("test", b"hello world".to_vec())
+                .await
+                .unwrap();
             let content = store.get_file("test").await.unwrap().unwrap();
             assert_eq!(content, b"hello world");
         })
@@ -77,7 +82,8 @@ mod tests {
             store.configure(None, 2, 4).await;
             store
                 .overwrite(vec![&"test".to_string()], |_| Ok(vec![1]))
-                .await.unwrap();
+                .await
+                .unwrap();
             let content = store.get_file("test").await.unwrap().unwrap();
             assert_eq!(content, [1]);
         })

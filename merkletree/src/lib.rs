@@ -68,12 +68,21 @@
 //!
 pub mod fsstore;
 pub mod memstore;
-use futures::lock::Mutex;
+use futures::{
+    StreamExt, TryStreamExt,
+    lock::Mutex,
+    stream::{self},
+};
 use quick_cache::sync::Cache;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt::Display,
+    future::Future,
+    sync::Arc,
+};
 use thiserror::Error;
-use std::{collections::{BTreeMap, HashSet}, future::Future, sync::{Arc}};
 use tracing::{debug, info, trace};
 type MResult<T, E> = std::result::Result<T, Error<E>>;
 
@@ -125,30 +134,28 @@ impl Key {
 }
 
 #[derive(Debug, Error)]
-pub enum Error<T> {
-    #[error("not found: {name}")]
-    NotFound {
-        name: String
-    },
+pub enum Error<T: Display> {
+    #[error("hash `{hash}` should be present, but was missing")]
+    NotFound { hash: String },
     #[error("failed to decode JSON")]
     Json(serde_json::Error),
-    #[error("backend error")]
-    Backend(T),
+    #[error("backend error: {inner:?}")]
+    Backend { inner: T },
     #[error("hash mismatch: expected {expected}, actual {actual}")]
-    HashMismatch {
-        expected: String,
-        actual: String,
-    },
+    HashMismatch { expected: String, actual: String },
 }
 
-impl<T> From<T> for Error<T> {
+impl<T> From<T> for Error<T>
+where
+    T: Display,
+{
     fn from(value: T) -> Self {
-        Self::Backend(value)
+        Self::Backend { inner: value }
     }
 }
 
 pub trait ReadObjectStore {
-    type E;
+    type E: Display;
 
     /// Read data by hash.
     fn read(
@@ -162,30 +169,29 @@ pub trait WriteObjectStore: ReadObjectStore {
     /// Write data into the store with the given hash.
     fn write(
         &self,
-        hash: &Hash,
-        data: &[u8],
+        hash: &str,
+        data: Vec<u8>,
         is_leaf: bool,
-    ) -> impl Future<Output = Result<(), Self::E>> + Send + Sync;
+    ) -> impl Future<Output = Result<(), Self::E>>;
 }
 
 pub trait GCObjectStore: ReadObjectStore {
     /// Delete an object.
-    fn delete(&self, hash: &Hash, is_leaf: bool) -> impl Future<Output = Result<(), Self::E>> + Send + Sync;
+    fn delete(&self, hash: &str, is_leaf: bool) -> impl Future<Output = Result<(), Self::E>>;
 
     /// Enumerate all hashes in the store (regardless of reachability).
     fn enumerate_all(
         &self,
-    ) -> impl std::future::Future<Output = Result<HashSet<(Hash, bool)>, Self::E>> + Send + Sync;
+    ) -> impl std::future::Future<Output = Result<HashSet<(String, bool)>, Self::E>>;
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 struct Node(BTreeMap<Key, Hash>); // prefix -> node hash
 
-
 pub struct MerkleStore<B: ReadObjectStore> {
     backend: B,
     params: Mutex<Option<TreeParameters>>,
-    node_cache: quick_cache::sync::Cache<Hash, Arc<Node>>
+    node_cache: quick_cache::sync::Cache<Hash, Arc<Node>>,
 }
 
 impl<B: ReadObjectStore> MerkleStore<B> {
@@ -201,8 +207,16 @@ impl<B: ReadObjectStore> MerkleStore<B> {
         &self.backend
     }
 
+    pub async fn is_configured(&self) -> bool {
+        self.params.lock().await.is_some()
+    }
+
     pub async fn configure(&self, root: Option<&str>, depth: usize, bredth: usize) {
-        *self.params.lock().await = Some(TreeParameters { root: root.map(|root|Hash(root.to_string())), depth, bredth });
+        *self.params.lock().await = Some(TreeParameters {
+            root: root.map(|root| Hash(root.to_string())),
+            depth,
+            bredth,
+        });
     }
 
     pub async fn get_file(&self, logical_name: &str) -> MResult<Option<Vec<u8>>, B::E> {
@@ -218,23 +232,38 @@ impl<B: ReadObjectStore> MerkleStore<B> {
     }
 
     pub async fn get_file_hash(&self, logical_name: &str) -> MResult<Option<String>, B::E> {
-        Ok(self.get_hash(logical_name).await?.map(|h|h.0))
+        Ok(self.get_hash(logical_name).await?.map(|h| h.0))
     }
 
     pub async fn root(&self) -> Option<String> {
-        self.params().await.root.map(|root|root.0)
+        self.params().await.root.map(|root| root.0)
     }
 
     async fn params(&self) -> TreeParameters {
-        self.params.lock().await.clone().expect("must call configure before using the tree")
+        self.params
+            .lock()
+            .await
+            .clone()
+            .expect("must call configure before using the tree")
     }
 
     // Reads from the store by hash.
     async fn read_object(&self, hash: &Hash, is_leaf: bool) -> MResult<Vec<u8>, B::E> {
-        let data = self.backend.read(&hash.0, is_leaf).await?.ok_or_else(||Error::NotFound{name: hash.0.clone()})?;
+        trace!(hash = &hash.0, "write");
+
+        let data = self
+            .backend
+            .read(&hash.0, is_leaf)
+            .await?
+            .ok_or_else(|| Error::NotFound {
+                hash: hash.0.clone(),
+            })?;
         let verification_hash = compute_hash(&data);
         if hash != &verification_hash {
-            return Err(Error::HashMismatch {expected: hash.0.to_string(), actual: verification_hash.0});
+            return Err(Error::HashMismatch {
+                expected: hash.0.to_string(),
+                actual: verification_hash.0,
+            });
         }
 
         trace!(len = data.len(), hash = hash.0, "reading object");
@@ -274,12 +303,16 @@ impl<B: ReadObjectStore> MerkleStore<B> {
     }
 
     async fn load_node(&self, hash: &Hash) -> MResult<Arc<Node>, B::E> {
-        self.node_cache.get_or_insert_async(hash, async { Ok(Arc::new(self.load_node_uncached(hash).await?)) }).await
+        self.node_cache
+            .get_or_insert_async(hash, async {
+                Ok(Arc::new(self.load_node_uncached(hash).await?))
+            })
+            .await
     }
 
     async fn load_node_uncached(&self, hash: &Hash) -> MResult<Node, B::E> {
         let data = self.read_object(hash, false).await?;
-        let data = serde_json::from_slice(&data).map_err(Error::Json)?;
+        let data = tracing::trace_span!("json-parsing").in_scope(||serde_json::from_slice(&data).map_err(Error::Json))?;
         Ok(data)
     }
 }
@@ -287,7 +320,7 @@ impl<B: ReadObjectStore> MerkleStore<B> {
 impl<B: WriteObjectStore> MerkleStore<B> {
     // Saves an object into the store, replacing if the name was already used.
     // Returns the object hash.
-    pub async fn put_object(&mut self, logical_name: &str, data: &[u8]) -> MResult<Hash, B::E> {
+    pub async fn put_object(&mut self, logical_name: &str, data: Vec<u8>) -> MResult<Hash, B::E> {
         let mut params = self.params.lock().await;
         let params = &mut *params.as_mut().unwrap();
 
@@ -297,52 +330,74 @@ impl<B: WriteObjectStore> MerkleStore<B> {
     }
 
     /// Overwrite the existing tree with the data.
-    pub async fn overwrite<F>(&mut self, d: impl IntoIterator<Item = &String>, f: F) -> MResult<Hash, B::E> 
-        where F: Fn(&String)->Result<Vec<u8>, B::E>,
+    pub async fn overwrite<F>(
+        &mut self,
+        d: impl IntoIterator<Item = &String>,
+        f: F,
+    ) -> MResult<Hash, B::E>
+    where
+        F: AsyncFn(&String) -> Result<Vec<u8>, B::E>,
     {
         let mut params = self.params.lock().await;
         let params = &mut *params.as_mut().unwrap();
 
         // insert leaf nodes.
         let mut prev = BTreeMap::new();
-        for logical_name in d {
-            let object_hash = self.write_object(&f(&logical_name)?, true).await?;
-            let key = Key::new(&logical_name, &params);
+        let mut futures = stream::iter(d.into_iter().map(|name| {
+            let f = &f;
+            let self_shared = &*self;
+            let key = Key::new(&name, params);
+            async move {
+                let object_hash = self_shared.write_object(f(&name).await?, true).await?;
+                MResult::Ok((key, object_hash))
+            }
+        }))
+        .buffer_unordered(10);
+        while let Some((key, object_hash)) = futures.try_next().await? {
             prev.insert(key, object_hash);
         }
+        drop(futures);
 
         info!("hashed {} leaf nodes", prev.len());
 
         // Insert metadata nodes.
-        for d in (0..params.depth).rev() {
+        for d in (1..params.depth + 1).rev() {
             debug!("inserting nodes at depth = {d}");
-            let mut next: BTreeMap<Key, BTreeMap<Key, Hash>> = BTreeMap::new();
+            let mut next: BTreeMap<Key, Node> = BTreeMap::new();
             for (key, object_hash) in prev.into_iter() {
-                let (bin, key) = key.split(d + 1, &params);
+                let (bin, key) = key.split(d, &params);
                 let entry = next.entry(bin).or_default();
-                entry.insert(key, object_hash);
+                entry.0.insert(key, object_hash);
             }
             trace!("split into {} bins", next.len());
 
             // Insert all the nodes
             prev = BTreeMap::new();
-            for (bin, subtree) in next.into_iter() {
-                let child_hash = self
-                    .write_object(&serde_json::to_vec(&Node(subtree)).map_err(Error::Json)?, false)
-                    .await?;
-                prev.insert(bin, child_hash);
+            let mut futures = stream::iter(next.into_iter().map(|(key, subtree)| {
+                let self_shared = &*self;
+                async move {
+                    let child_hash = self_shared.write_node(&subtree).await?;
+                    MResult::Ok((key, child_hash))
+                }
+            }))
+            .buffer_unordered(10);
+            while let Some((key, object_hash)) = futures.try_next().await? {
+                prev.insert(key, object_hash);
             }
         }
 
-        let root_hash = self
-            .write_object(&serde_json::to_vec(&Node(prev)).map_err(Error::Json)?, false)
-            .await?;
+        let root_hash = self.write_node(&Node(prev)).await?;
 
         params.root = Some(root_hash.clone());
         Ok(root_hash)
     }
 
-    async fn insert(&self, params: &mut TreeParameters, logical_name: &str, data: &[u8]) -> MResult<Hash, B::E> {
+    async fn insert(
+        &self,
+        params: &mut TreeParameters,
+        logical_name: &str,
+        data: Vec<u8>,
+    ) -> MResult<Hash, B::E> {
         let key = Key::new(logical_name, &params);
         debug!(logical_name, key = key.0, "inserting object");
 
@@ -377,48 +432,50 @@ impl<B: WriteObjectStore> MerkleStore<B> {
 
         // Walk back up, writing nodes
         while let Some((mut parent, subkey)) = stack.pop() {
-            let child_hash = self
-                .write_object(&serde_json::to_vec(&current).map_err(Error::Json)?, false)
-                .await?;
+            let child_hash = self.write_node(&current).await?;
             parent.0.insert(subkey, child_hash);
             current = parent;
         }
 
-        let new_root_hash = self
-            .write_object(&serde_json::to_vec(&current).map_err(Error::Json)?, false)
-            .await?;
+        let new_root_hash = self.write_node(&current).await?;
         debug!(root = new_root_hash.0, "new root hash");
         Ok(new_root_hash)
     }
 
     // Hashes the data and writes into the store.
     // Returns the object hash.
-    async fn write_object(&self, data: &[u8], is_leaf: bool) -> MResult<Hash, B::E> {
-        let hash = compute_hash(data);
-        self.backend.write(&hash, data, is_leaf).await?;
+    async fn write_object(&self, data: Vec<u8>, is_leaf: bool) -> MResult<Hash, B::E> {
+        let hash = compute_hash(&data);
+        trace!(hash = &hash.0, "write");
+        self.backend.write(&hash.0, data, is_leaf).await?;
         Ok(hash)
+    }
+
+    async fn write_node(&self, node: &Node) -> MResult<Hash, B::E> {
+        let data = serde_json::to_vec(&node).map_err(Error::Json)?;
+        self.write_object(data, false).await
     }
 }
 
 impl<B: GCObjectStore> MerkleStore<B> {
     // Deletes an object from the store.
     async fn delete_object(&self, hash: &Hash, is_leaf: bool) -> MResult<(), B::E> {
-        Ok(self.backend.delete(hash, is_leaf).await?)
+        Ok(self.backend.delete(&hash.0, is_leaf).await?)
     }
 
-    async fn enumerate_live_objects(&self) -> MResult<HashSet<(Hash, bool)>, B::E> {
+    async fn enumerate_live_objects(&self) -> MResult<HashSet<(String, bool)>, B::E> {
         let mut live = HashSet::new();
         let params = self.params().await;
         if let Some(head) = &params.root {
             let mut stack: Vec<(Hash, usize)> = Vec::new();
             stack.push((head.clone(), 0));
-            live.insert((head.clone(), false));
+            live.insert((head.0.clone(), false));
 
             while let Some((node_hash, depth)) = stack.pop() {
                 let node = self.load_node(&node_hash).await?;
                 for hash in node.0.values() {
                     let is_leaf = depth >= params.depth;
-                    if live.insert((hash.clone(), is_leaf)) && !is_leaf {
+                    if live.insert((hash.0.clone(), is_leaf)) && !is_leaf {
                         stack.push((hash.clone(), depth + 1));
                     }
                 }
@@ -428,7 +485,7 @@ impl<B: GCObjectStore> MerkleStore<B> {
         Ok(live)
     }
 
-    pub async fn gc(&self) -> MResult<Vec<(Hash, bool)>, B::E> {
+    pub async fn gc(&self) -> MResult<(), B::E> {
         debug!("starting GC");
 
         let live = self.enumerate_live_objects().await?;
@@ -441,12 +498,13 @@ impl<B: GCObjectStore> MerkleStore<B> {
         debug!(dead = dead.len(), "GC completed");
 
         for (entry, is_leaf) in &dead {
-            trace!(hash = entry.0, is_leaf, "deleted");
-            self.delete_object(entry, *is_leaf).await?
+            trace!(hash = entry, is_leaf, "deleted");
+            self.delete_object(&Hash(entry.to_owned()), *is_leaf)
+                .await?
         }
         debug!("GC delete completed");
 
-        Ok(dead)
+        Ok(())
     }
 }
 

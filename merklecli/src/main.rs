@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
@@ -6,9 +7,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use merkletree::{MerkleStore, fsstore::FsStore};
+use merkletree::{GCObjectStore, MerkleStore, ReadObjectStore, WriteObjectStore, fsstore::FsStore};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
 use walkdir::{DirEntry, WalkDir};
+
+use crate::gcp::GcpStore;
+mod gcp;
 mod server;
 
 #[derive(Parser)]
@@ -84,22 +90,44 @@ async fn main() -> anyhow::Result<()> {
         240000 / bin_count
     );
 
-    let backend = FsStore::new(&cli.path)?;
+    trace!("creating backend");
+    let backend = FsStore::new(&cli.path.join("merkle"))?;
+    let backend = GcpStore::new()?;
     let mut store = MerkleStore::new(backend);
-    let root_path = cli.path.join("index.json");
-    let root = std::fs::read_to_string(&root_path).ok();
-    store.configure(root.as_deref(), cli.tree_depth, cli.tree_bredth).await;
+    let root_path = cli.path.join("config.json");
+    let mut config = std::fs::read(&root_path)
+        .ok()
+        .and_then(|v| serde_json::from_slice(&v).ok())
+        .unwrap_or_else(|| RegistryConfig {
+            dl: "https://static.crates.io/crates".to_string(),
+            api: Some("https://crates.io/".to_string()),
+            merkle: None,
+        });
+
+    let depth = config
+        .merkle
+        .as_ref()
+        .map(|m| m.depth)
+        .unwrap_or(cli.tree_depth);
+    let bredth = config
+        .merkle
+        .as_ref()
+        .map(|m| m.bredth)
+        .unwrap_or(cli.tree_bredth);
+    let root = config.merkle.as_ref().map(|m| m.root.as_str());
+    trace!("configure store");
+    store.configure(root, depth, bredth).await;
 
     match cli.cmd {
         Cmd::Serve { port, key, cert } => {
-            server::serve(store, port, &cert, &key, (cli.tree_depth, cli.tree_bredth)).await?;
+            // server::serve(store, port, &cert, &key, (depth, bredth)).await?;
             return Ok(());
         }
 
         Cmd::Put { logical_name, path } => {
             let data =
                 fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-            store.put_object(&logical_name, &data).await?;
+            store.put_object(&logical_name, data).await?;
         }
         Cmd::Overwrite { path } => {
             overwrite_with(&mut store, &path).await?;
@@ -114,16 +142,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(root) = store.root().await {
-        std::fs::write(root_path, root)?;
+        config.merkle = Some(MerkleConfig {
+            root,
+            depth,
+            bredth,
+        });
+        std::fs::write(&root_path, &serde_json::to_vec_pretty(&config)?)?;
     }
 
     Ok(())
 }
 
-async fn overwrite_with(
-    store: &mut MerkleStore<FsStore>,
-    path: &Path,
-) -> Result<(), anyhow::Error> {
+async fn overwrite_with(store: &mut MerkleStore<GcpStore>, path: &Path) -> anyhow::Result<()> {
+    info!("collecting files");
     let walker = WalkDir::new(path).into_iter();
     let mut files = HashMap::new();
     for entry in walker.filter_entry(|e| !is_hidden(e)) {
@@ -135,7 +166,40 @@ async fn overwrite_with(
         let logical_name = entry.file_name().to_str().unwrap();
         files.insert(logical_name.to_string(), path.to_path_buf());
     }
-    store.overwrite(files.keys(), |p| Ok(std::fs::read(p)?)).await?;
+    let total = files.len();
+    info!("overwriting files {total}");
+    let count = Cell::new(0);
+    store
+        .overwrite(files.keys(), async |p| {
+            count.update(|v| v + 1);
+            let c = count.get();
+            if c % 1000 == 0 {
+                debug!("{c}/{total}");
+            }
+            Ok(
+                tokio::fs::read(&files[p]).await.map_err(|e| object_store::Error::Generic {
+                    store: "",
+                    source: e.into(),
+                })?,
+            )
+        })
+        .await?;
 
     Ok(())
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct RegistryConfig {
+    pub dl: String,
+    pub api: Option<String>,
+    pub merkle: Option<MerkleConfig>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case")]
+pub struct MerkleConfig {
+    pub root: String,
+    pub depth: usize,
+    pub bredth: usize,
 }

@@ -1,14 +1,17 @@
 use axum::{
     Router,
     extract::{Extension, Path},
-    http::{StatusCode},
+    http::StatusCode,
     response::{Html, IntoResponse},
     routing::get,
 };
 use axum_server::tls_rustls::RustlsConfig;
 use merkletree::{MerkleStore, ReadObjectStore, fsstore::FsStore};
 use std::{
-    net::SocketAddr, path::{self}, sync::Arc, time::Duration
+    net::SocketAddr,
+    path::{self},
+    sync::Arc,
+    time::Duration,
 };
 
 struct Data {
@@ -76,7 +79,8 @@ async fn config_handler(Extension(store): Extension<Arc<Data>>) -> impl IntoResp
     let root = store.store.root().await.unwrap();
     let depth = store.depth;
     let bredth = store.bredth;
-    format!(r#"
+    format!(
+        r#"
 {{
   "dl": "https://static.crates.io/crates",
   "api": "https://crates.io",
@@ -86,7 +90,8 @@ async fn config_handler(Extension(store): Extension<Arc<Data>>) -> impl IntoResp
     "root": "{root}"
   }}
 }}
-"#)
+"#
+    )
 }
 
 async fn root(Extension(store): Extension<Arc<Data>>) -> impl IntoResponse {
@@ -113,7 +118,7 @@ async fn clear(Extension(_store): Extension<Arc<Data>>) -> impl IntoResponse {
 async fn merkle_handler(
     Path(hash): Path<String>,
     Extension(store): Extension<Arc<Data>>,
-    is_leaf: bool
+    is_leaf: bool,
 ) -> impl IntoResponse {
     futures_timer::Delay::new(Duration::from_millis(100)).await;
 
@@ -132,17 +137,11 @@ async fn merkle_handler(
     }
 }
 
-async fn merkle_handler_data(
-    hash: Path<String>,
-    store: Extension<Arc<Data>>,
-) -> impl IntoResponse {
+async fn merkle_handler_data(hash: Path<String>, store: Extension<Arc<Data>>) -> impl IntoResponse {
     merkle_handler(hash, store, true).await
 }
 
-async fn merkle_handler_tree(
-    hash: Path<String>,
-    store: Extension<Arc<Data>>,
-) -> impl IntoResponse {
+async fn merkle_handler_tree(hash: Path<String>, store: Extension<Arc<Data>>) -> impl IntoResponse {
     merkle_handler(hash, store, false).await
 }
 
