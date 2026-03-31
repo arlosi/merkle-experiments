@@ -10,12 +10,12 @@
 //! Since all file names are content-based, they can be cached forever without needing invalidations.
 //! (except the root).
 //!
-//! Hash function: SHA256 + base64-encode (43 chars).
+//! ContentHash function: SHA256 + base64-encode (43 chars).
 //!
 //! Lookup process:
 //! 1. Load the root node hash from somewhere (config.json?).
 //! 2. Validate that the root node hash using TUF (not defined how that works here).
-//! 3. Hash the crate name to get the name hash.
+//! 3. ContentHash the crate name to get the name hash.
 //! 4. Fetch the root node from the index (using it's hash).
 //! 5. Traverse the prefix tree until we find the content.
 //!    Keys in each level of the tree use a fixed number of characters from the hash as the prefix.
@@ -69,80 +69,46 @@
 pub mod fsstore;
 pub mod memstore;
 use futures::{
-    StreamExt, TryStreamExt,
-    lock::Mutex,
-    stream::{self},
+    StreamExt, TryStreamExt, lock::Mutex, stream::{self, FuturesUnordered}
 };
 use quick_cache::sync::Cache;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{HashMap, HashSet},
     fmt::Display,
     future::Future,
     sync::Arc,
 };
 use thiserror::Error;
-use tracing::{debug, info, trace};
+use tracing::{debug, trace};
+
+use crate::bitslice::{IndexNode, LeafNode, Node};
 type MResult<T, E> = std::result::Result<T, Error<E>>;
+mod bitslice;
+use bitslice::SplitNameHash;
+
+pub use crate::bitslice::ContentHash;
 
 #[derive(Clone)]
 pub struct TreeParameters {
-    root: Option<Hash>,
-    depth: usize,
-    bredth: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
-pub struct Hash(String);
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-struct Key(String);
-
-impl Key {
-    pub fn new(name: &str, params: &TreeParameters) -> Self {
-        let hash_prefix_len = params.depth * params.bredth;
-        let digest = Sha256::digest(name);
-        let mut out = String::with_capacity(name.len() + hash_prefix_len);
-        out.extend(
-            digest
-                .iter()
-                .flat_map(|byte| (0..8).map(move |bit| ((byte >> bit & 1) + b'0') as char))
-                .take(hash_prefix_len),
-        );
-        out.push_str(name);
-        Key(out)
-    }
-
-    pub fn split(&self, at: usize, params: &TreeParameters) -> (Key, Key) {
-        let (l, r) = self.0.split_at(at * params.bredth);
-        (Key(l.to_string()), Key(r.to_string()))
-    }
-
-    pub fn take_one(&mut self, params: &TreeParameters) -> Key {
-        if self.0.len() < params.bredth {
-            let mut r = Key(String::new());
-            std::mem::swap(&mut r, self);
-            return r;
-        }
-
-        let mut r = Key(self.0.split_off(params.bredth));
-        std::mem::swap(&mut r, self);
-        r
-    }
+    root: Option<ContentHash>,
+    depth: u8,
+    bredth: u8,
 }
 
 #[derive(Debug, Error)]
 pub enum Error<T: Display> {
     #[error("hash `{hash}` should be present, but was missing")]
-    NotFound { hash: String },
+    NotFound { hash: ContentHash },
     #[error("failed to decode JSON")]
     Json(serde_json::Error),
     #[error("backend error: {inner:?}")]
     Backend { inner: T },
     #[error("hash mismatch: expected {expected}, actual {actual}")]
-    HashMismatch { expected: String, actual: String },
+    HashMismatch {
+        expected: ContentHash,
+        actual: ContentHash,
+    },
 }
 
 impl<T> From<T> for Error<T>
@@ -154,52 +120,55 @@ where
     }
 }
 
-pub trait ReadObjectStore {
-    type E: Display;
+pub trait TreeReader {
+    type Error: Display;
 
     /// Read data by hash.
     fn read(
         &self,
-        hash: &str,
+        hash: &ContentHash,
         is_leaf: bool,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, Self::E>>;
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>>;
 }
 
-pub trait WriteObjectStore: ReadObjectStore {
+pub trait TreeWriter: TreeReader {
     /// Write data into the store with the given hash.
     fn write(
         &self,
-        hash: &str,
+        hash: &ContentHash,
         data: Vec<u8>,
         is_leaf: bool,
-    ) -> impl Future<Output = Result<(), Self::E>>;
+    ) -> impl Future<Output = Result<(), Self::Error>>;
 }
 
-pub trait GCObjectStore: ReadObjectStore {
+pub trait GCObjectStore: TreeReader {
     /// Delete an object.
-    fn delete(&self, hash: &str, is_leaf: bool) -> impl Future<Output = Result<(), Self::E>>;
+    fn delete(
+        &self,
+        hash: &ContentHash,
+        is_leaf: bool,
+    ) -> impl Future<Output = Result<(), Self::Error>>;
 
     /// Enumerate all hashes in the store (regardless of reachability).
     fn enumerate_all(
         &self,
-    ) -> impl std::future::Future<Output = Result<HashSet<(String, bool)>, Self::E>>;
+    ) -> impl std::future::Future<Output = Result<HashSet<(ContentHash, bool)>, Self::Error>>;
 }
 
-#[derive(Serialize, Deserialize, Default, Debug, Clone)]
-struct Node(BTreeMap<Key, Hash>); // prefix -> node hash
-
-pub struct MerkleStore<B: ReadObjectStore> {
+pub struct MerkleStore<B: TreeReader> {
     backend: B,
+    node_cache: quick_cache::sync::Cache<ContentHash, Arc<Node>>,
     params: Mutex<Option<TreeParameters>>,
-    node_cache: quick_cache::sync::Cache<Hash, Arc<Node>>,
+    pending_writes: std::sync::Mutex<Vec<(String, ContentHash)>>,
 }
 
-impl<B: ReadObjectStore> MerkleStore<B> {
+impl<B: TreeReader> MerkleStore<B> {
     pub fn new(backend: B) -> Self {
         Self {
             backend,
             params: Mutex::new(None),
             node_cache: Cache::new(usize::MAX),
+            pending_writes: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -211,32 +180,40 @@ impl<B: ReadObjectStore> MerkleStore<B> {
         self.params.lock().await.is_some()
     }
 
-    pub async fn configure(&self, root: Option<&str>, depth: usize, bredth: usize) {
+    pub async fn configure(&self, root: Option<ContentHash>, depth: usize, bredth: usize) {
         *self.params.lock().await = Some(TreeParameters {
-            root: root.map(|root| Hash(root.to_string())),
-            depth,
-            bredth,
+            root: root,
+            depth: depth as u8,
+            bredth: bredth as u8,
         });
     }
 
-    pub async fn get_file(&self, logical_name: &str) -> MResult<Option<Vec<u8>>, B::E> {
-        if let Some(hash) = self.get_hash(logical_name).await? {
-            Ok(Some(self.read_object(&hash, true).await?))
-        } else {
-            Ok(None)
+    pub async fn get_file(&self, name: &str) -> MResult<Option<Vec<u8>>, B::Error> {
+        match self.get_file_hash(name).await? {
+            Some(hash) => Ok(Some(self.get_file_by_hash(&hash).await?)),
+            None => Ok(None),
         }
     }
 
-    pub async fn get_file_by_hash(&self, hash: &str) -> MResult<Option<Vec<u8>>, B::E> {
-        Ok(Some(self.read_object(&Hash(hash.to_string()), true).await?))
+    pub async fn get_file_by_hash(&self, hash: &ContentHash) -> MResult<Vec<u8>, B::Error> {
+        Ok(self.read_object(hash, true).await?)
     }
 
-    pub async fn get_file_hash(&self, logical_name: &str) -> MResult<Option<String>, B::E> {
-        Ok(self.get_hash(logical_name).await?.map(|h| h.0))
+    pub async fn get_file_hash(&self, name: &str) -> MResult<Option<ContentHash>, B::Error> {
+        trace!(?name, "get_file_hash");
+        let key = SplitNameHash::new(name, 32);
+        let hash = self
+            .lookup(self.root().await.as_ref(), key)
+            .await?
+            .as_ref()
+            .and_then(|node| node.as_leaf())
+            .and_then(|node| node.get(name))
+            .cloned();
+        Ok(hash)
     }
 
-    pub async fn root(&self) -> Option<String> {
-        self.params().await.root.map(|root| root.0)
+    pub async fn root(&self) -> Option<ContentHash> {
+        self.params().await.root
     }
 
     async fn params(&self) -> TreeParameters {
@@ -248,235 +225,204 @@ impl<B: ReadObjectStore> MerkleStore<B> {
     }
 
     // Reads from the store by hash.
-    async fn read_object(&self, hash: &Hash, is_leaf: bool) -> MResult<Vec<u8>, B::E> {
-        trace!(hash = &hash.0, "write");
-
+    async fn read_object(&self, hash: &ContentHash, is_leaf: bool) -> MResult<Vec<u8>, B::Error> {
         let data = self
             .backend
-            .read(&hash.0, is_leaf)
+            .read(&hash, is_leaf)
             .await?
-            .ok_or_else(|| Error::NotFound {
-                hash: hash.0.clone(),
-            })?;
+            .ok_or_else(|| Error::NotFound { hash: hash.clone() })?;
         let verification_hash = compute_hash(&data);
         if hash != &verification_hash {
             return Err(Error::HashMismatch {
-                expected: hash.0.to_string(),
-                actual: verification_hash.0,
+                expected: hash.clone(),
+                actual: verification_hash,
             });
         }
-
-        trace!(len = data.len(), hash = hash.0, "reading object");
         Ok(data)
     }
 
-    async fn get_hash(&self, logical_name: &str) -> MResult<Option<Hash>, B::E> {
-        let params = self.params().await;
-        let key = Key::new(logical_name, &params);
-        debug!(logical_name, key = key.0, "get_hash");
-
-        let Some(head) = &params.root else {
-            return Ok(None);
-        };
-
-        let mut node = self.load_node(head).await?;
-        let mut remaining_key = key.clone();
-
-        loop {
-            trace!("looking up {}", remaining_key.0);
-            if let Some(leaf) = node.0.get(&remaining_key) {
-                debug!(logical_name, content_hash = leaf.0, "get_hash resolved");
-                return Ok(Some(leaf.clone()));
-            }
-
-            let subkey = remaining_key.take_one(&params);
-
-            let child = match node.0.get(&subkey) {
-                Some(h) => h,
-                None => {
-                    return Ok(None);
+    async fn lookup(
+        &self,
+        mut hash: Option<&ContentHash>,
+        mut key: SplitNameHash,
+    ) -> MResult<Option<Arc<Node>>, B::Error> {
+        trace!(?key, "lookup");
+        let mut node = None;
+        while let Some(h) = hash {
+            node = Some(self.load_node(&h).await?);
+            match node.as_deref().unwrap() {
+                Node::Index(index_node) => {
+                    if key.is_empty() {
+                        return Ok(node);
+                    }
+                    let (remaining, index) = key.split(index_node.len_bits());
+                    key = remaining;
+                    hash = index_node.get(index);
                 }
-            };
-
-            node = self.load_node(&child).await?;
+                Node::Leaf(..) => return Ok(node),
+            }
         }
+        Ok(node)
     }
 
-    async fn load_node(&self, hash: &Hash) -> MResult<Arc<Node>, B::E> {
+    async fn load_node_uncached(&self, hash: &ContentHash) -> MResult<Node, B::Error> {
+        let data = self.read_object(hash, false).await?;
+        let node = Node::deserialize(data);
+        trace!(?hash, "load_node");
+        Ok(node)
+    }
+
+    async fn load_node(&self, hash: &ContentHash) -> MResult<Arc<Node>, B::Error> {
         self.node_cache
             .get_or_insert_async(hash, async {
                 Ok(Arc::new(self.load_node_uncached(hash).await?))
             })
             .await
     }
-
-    async fn load_node_uncached(&self, hash: &Hash) -> MResult<Node, B::E> {
-        let data = self.read_object(hash, false).await?;
-        let data = tracing::trace_span!("json-parsing").in_scope(||serde_json::from_slice(&data).map_err(Error::Json))?;
-        Ok(data)
-    }
 }
 
-impl<B: WriteObjectStore> MerkleStore<B> {
+impl<B: TreeWriter> MerkleStore<B> {
     // Saves an object into the store, replacing if the name was already used.
-    // Returns the object hash.
-    pub async fn put_object(&mut self, logical_name: &str, data: Vec<u8>) -> MResult<Hash, B::E> {
-        let mut params = self.params.lock().await;
-        let params = &mut *params.as_mut().unwrap();
-
-        let new_root = self.insert(params, logical_name, data).await?;
-        params.root = Some(new_root.clone());
-        Ok(new_root)
+    pub async fn put_object(&self, logical_name: &str, data: Vec<u8>) -> MResult<(), B::Error> {
+        self.insert(logical_name, data).await?;
+        Ok(())
     }
 
-    /// Overwrite the existing tree with the data.
-    pub async fn overwrite<F>(
-        &mut self,
-        d: impl IntoIterator<Item = &String>,
-        f: F,
-    ) -> MResult<Hash, B::E>
-    where
-        F: AsyncFn(&String) -> Result<Vec<u8>, B::E>,
-    {
+    async fn insert(&self, name: &str, data: Vec<u8>) -> MResult<(), B::Error> {
+        let hash = self.write_object(data, true).await?;
+        self.pending_writes
+            .lock()
+            .unwrap()
+            .push((name.to_string(), hash));
+        Ok(())
+    }
+
+    pub async fn commit(&self) -> MResult<(), B::Error> {
+        debug!("commit:starting");
+        // Hold the lock to prevent dropped writes.
         let mut params = self.params.lock().await;
-        let params = &mut *params.as_mut().unwrap();
+        let params = &mut *params.as_mut().expect("no params");
+        let root = params.root;
+        let tree_depth = params.depth;
+        let tree_bredth = params.bredth;
 
-        // insert leaf nodes.
-        let mut prev = BTreeMap::new();
-        let mut futures = stream::iter(d.into_iter().map(|name| {
-            let f = &f;
-            let self_shared = &*self;
-            let key = Key::new(&name, params);
-            async move {
-                let object_hash = self_shared.write_object(f(&name).await?, true).await?;
-                MResult::Ok((key, object_hash))
-            }
-        }))
-        .buffer_unordered(10);
-        while let Some((key, object_hash)) = futures.try_next().await? {
-            prev.insert(key, object_hash);
+        // Group all the pending writes into buckets by hash.
+        let pending = std::mem::take(&mut *self.pending_writes.lock().unwrap());
+        debug!(pending = pending.len(), "commit:grouping");
+        let mut premap: HashMap<SplitNameHash, Vec<(String, ContentHash)>> = HashMap::new();
+        for (name, hash) in pending {
+            let key = SplitNameHash::new(&name, tree_depth * tree_bredth);
+            premap.entry(key).or_default().push((name, hash))
         }
-        drop(futures);
 
-        info!("hashed {} leaf nodes", prev.len());
-
-        // Insert metadata nodes.
-        for d in (1..params.depth + 1).rev() {
-            debug!("inserting nodes at depth = {d}");
-            let mut next: BTreeMap<Key, Node> = BTreeMap::new();
-            for (key, object_hash) in prev.into_iter() {
-                let (bin, key) = key.split(d, &params);
-                let entry = next.entry(bin).or_default();
-                entry.0.insert(key, object_hash);
+        debug!(pending = premap.len(), "commit:writing leaves");
+        let mut map: HashMap<SplitNameHash, Vec<(SplitNameHash, ContentHash)>> = HashMap::new();
+        let mut futures = stream::iter(premap.into_iter().map(|(key, v) | async move {
+            // Find an existing leaf node to merge with.
+            let node = self.lookup(root.as_ref(), key).await?;
+            let mut node = node
+                .as_ref()
+                .and_then(|node| node.as_leaf())
+                .cloned()
+                .unwrap_or_else(|| LeafNode::new());
+            for (key, value) in v {
+                node.insert(key, value);
             }
-            trace!("split into {} bins", next.len());
+            let hash = self.write_node(&Node::Leaf(node)).await?;
+            MResult::Ok((key, hash))
+        })).buffer_unordered(50);
+        while let Some((key, hash)) = futures.try_next().await? {
+            if tree_depth == 0 {
+                params.root = Some(hash);
+                return Ok(());
+            }
+            let (left, right) = key.split(tree_bredth * (tree_depth - 1));
+            map.entry(right).or_default().push((left, hash));
+        }
 
-            // Insert all the nodes
-            prev = BTreeMap::new();
-            let mut futures = stream::iter(next.into_iter().map(|(key, subtree)| {
-                let self_shared = &*self;
-                async move {
-                    let child_hash = self_shared.write_node(&subtree).await?;
-                    MResult::Ok((key, child_hash))
+        let mut next_root = root;
+        for depth in (0..tree_depth).rev() {
+            debug!(pending = map.len(), depth, "commit:writing tree at depth");
+            let mut next_map: HashMap<SplitNameHash, Vec<_>> = HashMap::new();
+            let mut futures = stream::iter(map.into_iter().map(|(key, v)| async move {
+                trace!("writing into node {key:?}");
+                let node = self.lookup(root.as_ref(), key).await?;
+                let mut node = node
+                    .as_ref()
+                    .and_then(|n| n.as_index())
+                    .cloned()
+                    .unwrap_or_else(|| IndexNode::new(tree_bredth));
+
+                for (index, value) in v {
+                    node.insert(index, value);
                 }
-            }))
-            .buffer_unordered(10);
-            while let Some((key, object_hash)) = futures.try_next().await? {
-                prev.insert(key, object_hash);
+
+                let hash = self.write_node(&Node::Index(node)).await?;
+                MResult::Ok((key, hash))
+            })).buffer_unordered(50);
+            while let Some((key, hash)) = futures.try_next().await? {
+                next_root = Some(hash);
+                if depth > 0 {
+                    let (left, right) = key.split(tree_bredth * (depth - 1));
+                    next_map.entry(right).or_default().push((left, hash));
+                }
             }
+
+            map = next_map;
         }
 
-        let root_hash = self.write_node(&Node(prev)).await?;
-
-        params.root = Some(root_hash.clone());
-        Ok(root_hash)
+        params.root = next_root;
+        Ok(())
     }
 
-    async fn insert(
-        &self,
-        params: &mut TreeParameters,
-        logical_name: &str,
-        data: Vec<u8>,
-    ) -> MResult<Hash, B::E> {
-        let key = Key::new(logical_name, &params);
-        debug!(logical_name, key = key.0, "inserting object");
-
-        // Stack of (node, subkey used to reach this node)
-        let mut stack: Vec<(Node, Key)> = Vec::with_capacity(params.depth);
-
-        let root = match &params.root {
-            Some(root) => (&*self.load_node(root).await?).clone(),
-            None => Node::default(),
-        };
-
-        let mut current = root;
-        let mut remaining_key = key.clone();
-        for _ in 0..params.depth {
-            let subkey = remaining_key.take_one(&params);
-
-            let child = match current.0.get(&subkey) {
-                Some(h) => (&*self.load_node(h).await?).clone(),
-                None => Node::default(),
-            };
-
-            stack.push((current, subkey));
-            current = child;
-        }
-
-        // Write the object data
-        let content_hash = self.write_object(data, true).await?;
-
-        // Insert leaf
-        debug!(key = key.0, hash = content_hash.0, "writing leaf");
-        current.0.insert(remaining_key, content_hash);
-
-        // Walk back up, writing nodes
-        while let Some((mut parent, subkey)) = stack.pop() {
-            let child_hash = self.write_node(&current).await?;
-            parent.0.insert(subkey, child_hash);
-            current = parent;
-        }
-
-        let new_root_hash = self.write_node(&current).await?;
-        debug!(root = new_root_hash.0, "new root hash");
-        Ok(new_root_hash)
-    }
-
-    // Hashes the data and writes into the store.
-    // Returns the object hash.
-    async fn write_object(&self, data: Vec<u8>, is_leaf: bool) -> MResult<Hash, B::E> {
+    /// Hashes the data and writes into the store.
+    /// Returns the object hash.
+    async fn write_object(&self, data: Vec<u8>, is_leaf: bool) -> MResult<ContentHash, B::Error> {
         let hash = compute_hash(&data);
-        trace!(hash = &hash.0, "write");
-        self.backend.write(&hash.0, data, is_leaf).await?;
+        trace!(hash = ?hash, "write");
+        self.backend.write(&hash, data, is_leaf).await?;
         Ok(hash)
     }
 
-    async fn write_node(&self, node: &Node) -> MResult<Hash, B::E> {
-        let data = serde_json::to_vec(&node).map_err(Error::Json)?;
+    async fn write_node(&self, node: &Node) -> MResult<ContentHash, B::Error> {
+        trace!(?node, "write_node");
+        let data = node.serialize();
         self.write_object(data, false).await
     }
 }
 
 impl<B: GCObjectStore> MerkleStore<B> {
     // Deletes an object from the store.
-    async fn delete_object(&self, hash: &Hash, is_leaf: bool) -> MResult<(), B::E> {
-        Ok(self.backend.delete(&hash.0, is_leaf).await?)
+    async fn delete_object(&self, hash: &ContentHash, is_leaf: bool) -> MResult<(), B::Error> {
+        Ok(self.backend.delete(&hash, is_leaf).await?)
     }
 
-    async fn enumerate_live_objects(&self) -> MResult<HashSet<(String, bool)>, B::E> {
+    async fn enumerate_live_objects(&self) -> MResult<HashSet<(ContentHash, bool)>, B::Error> {
         let mut live = HashSet::new();
         let params = self.params().await;
-        if let Some(head) = &params.root {
-            let mut stack: Vec<(Hash, usize)> = Vec::new();
-            stack.push((head.clone(), 0));
-            live.insert((head.0.clone(), false));
 
-            while let Some((node_hash, depth)) = stack.pop() {
-                let node = self.load_node(&node_hash).await?;
-                for hash in node.0.values() {
-                    let is_leaf = depth >= params.depth;
-                    if live.insert((hash.0.clone(), is_leaf)) && !is_leaf {
-                        stack.push((hash.clone(), depth + 1));
+        if let Some(head) = &params.root {
+            // Takes the content hash by value
+            let load_node = async|hash: ContentHash|self.load_node(&hash).await;
+            let mut pending = FuturesUnordered::new();
+            // Insert the root to get started
+            pending.push(load_node(*head) );
+            live.insert((head.clone(), false));
+            while let Some(node) = pending.try_next().await? {
+                match &*node {
+                    Node::Index(index_node) => {
+                        for hash in index_node.iter() {
+                            if live.insert((hash.clone(), false)) {
+                                let hash = hash.clone();
+                                pending.push(load_node(hash) );
+                            }
+                        }
+                    }
+                    Node::Leaf(leaf_node) => {
+                        for (name, hash) in leaf_node.iter() {
+                            trace!(name, ?hash);
+                            live.insert((hash.clone(), true));
+                        }
                     }
                 }
             }
@@ -485,22 +431,21 @@ impl<B: GCObjectStore> MerkleStore<B> {
         Ok(live)
     }
 
-    pub async fn gc(&self) -> MResult<(), B::E> {
+    pub async fn gc(&self) -> MResult<(), B::Error> {
         debug!("starting GC");
-
-        let live = self.enumerate_live_objects().await?;
-        debug!(live = live.len(), "live objects enumerated");
 
         let all = self.backend.enumerate_all().await?;
         debug!(all = all.len(), "all objects enumerated");
+
+        let live = self.enumerate_live_objects().await?;
+        debug!(live = live.len(), "live objects enumerated");
 
         let dead: Vec<_> = all.difference(&live).cloned().collect();
         debug!(dead = dead.len(), "GC completed");
 
         for (entry, is_leaf) in &dead {
-            trace!(hash = entry, is_leaf, "deleted");
-            self.delete_object(&Hash(entry.to_owned()), *is_leaf)
-                .await?
+            trace!(hash = ?entry, is_leaf, "deleted");
+            self.delete_object(entry, *is_leaf).await?
         }
         debug!("GC delete completed");
 
@@ -508,9 +453,7 @@ impl<B: GCObjectStore> MerkleStore<B> {
     }
 }
 
-fn compute_hash(data: &[u8]) -> Hash {
-    use base64::Engine as _;
-    let digest = Sha256::digest(data);
-    let algorithm = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    Hash(algorithm.encode(digest))
+fn compute_hash(data: &[u8]) -> ContentHash {
+    let output: [u8; 32] = Sha256::digest(data).into();
+    output.into()
 }

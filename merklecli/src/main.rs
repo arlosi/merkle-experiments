@@ -1,16 +1,14 @@
 use std::{
-    cell::Cell,
-    collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
+    cell::Cell, collections::HashMap, fs, path::{Path, PathBuf}, sync::Arc
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context};
 use clap::{Parser, Subcommand};
-use merkletree::{GCObjectStore, MerkleStore, ReadObjectStore, WriteObjectStore, fsstore::FsStore};
+use futures::{StreamExt, TryStreamExt as _, stream};
+use merkletree::{MerkleStore, fsstore::FsStore};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, trace};
-use tracing_subscriber::EnvFilter;
+use tracing::{info, trace};
+use tracing_subscriber::{EnvFilter, field::MakeExt as _};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::gcp::GcpStore;
@@ -38,7 +36,7 @@ enum Cmd {
     /// Store a file by content hash
     Put { logical_name: String, path: PathBuf },
     /// Overwrite the based on a crates.io directory tree.
-    Overwrite { path: PathBuf },
+    PutDir { path: PathBuf },
     /// Lookup a logical name and return the content hash
     Get { logical_name: String },
     /// Collect garbage
@@ -74,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
+        .map_fmt_fields(|f| f.debug_alt())
         .init();
     eprintln!(
         "tree parameters: depth = {}, bredth = {}",
@@ -91,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     trace!("creating backend");
-    let backend = FsStore::new(&cli.path.join("merkle"))?;
+    // let backend = FsStore::new(&cli.path.join("merkle"))?;
     let backend = GcpStore::new()?;
     let mut store = MerkleStore::new(backend);
     let root_path = cli.path.join("config.json");
@@ -104,33 +103,23 @@ async fn main() -> anyhow::Result<()> {
             merkle: None,
         });
 
-    let depth = config
-        .merkle
-        .as_ref()
-        .map(|m| m.depth)
-        .unwrap_or(cli.tree_depth);
-    let bredth = config
-        .merkle
-        .as_ref()
-        .map(|m| m.bredth)
-        .unwrap_or(cli.tree_bredth);
     let root = config.merkle.as_ref().map(|m| m.root.as_str());
-    trace!("configure store");
-    store.configure(root, depth, bredth).await;
+    trace!(?root, "configure store");
+    store.configure(root.map(|v|v.try_into().unwrap()), cli.tree_depth, cli.tree_bredth).await;
 
     match cli.cmd {
         Cmd::Serve { port, key, cert } => {
-            // server::serve(store, port, &cert, &key, (depth, bredth)).await?;
+            // server::serve(store, port, &cert, &key).await?;
             return Ok(());
         }
-
         Cmd::Put { logical_name, path } => {
             let data =
                 fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
             store.put_object(&logical_name, data).await?;
+            store.commit().await.unwrap();
         }
-        Cmd::Overwrite { path } => {
-            overwrite_with(&mut store, &path).await?;
+        Cmd::PutDir { path } => {
+            add_dir(&mut store, &path).await?;
         }
         Cmd::Get { logical_name } => match store.get_file(&logical_name).await? {
             Some(content) => println!("{}", String::from_utf8(content)?),
@@ -143,9 +132,7 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(root) = store.root().await {
         config.merkle = Some(MerkleConfig {
-            root,
-            depth,
-            bredth,
+            root: root.to_string(),
         });
         std::fs::write(&root_path, &serde_json::to_vec_pretty(&config)?)?;
     }
@@ -153,7 +140,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn overwrite_with(store: &mut MerkleStore<GcpStore>, path: &Path) -> anyhow::Result<()> {
+async fn add_dir(store: &mut MerkleStore<GcpStore>, path: &Path) -> anyhow::Result<()> {
+// async fn add_dir(store: &mut MerkleStore<FsStore>, path: &Path) -> anyhow::Result<()> {
     info!("collecting files");
     let walker = WalkDir::new(path).into_iter();
     let mut files = HashMap::new();
@@ -168,22 +156,24 @@ async fn overwrite_with(store: &mut MerkleStore<GcpStore>, path: &Path) -> anyho
     }
     let total = files.len();
     info!("overwriting files {total}");
-    let count = Cell::new(0);
-    store
-        .overwrite(files.keys(), async |p| {
-            count.update(|v| v + 1);
-            let c = count.get();
-            if c % 1000 == 0 {
-                debug!("{c}/{total}");
+
+    let complete = Arc::new(Cell::new(0));
+    let mut s = stream::iter(files.into_iter().map(|(name, path)|{
+        let store = &*store;
+        let complete = complete.clone();
+        async move {
+            complete.update(|v|v+1);
+            if complete.get() % 1000 == 0 {
+                println!("{}k", complete.get()/1000);
             }
-            Ok(
-                tokio::fs::read(&files[p]).await.map_err(|e| object_store::Error::Generic {
-                    store: "",
-                    source: e.into(),
-                })?,
-            )
-        })
-        .await?;
+            store
+                .put_object(&name, tokio::fs::read(&path).await.unwrap())
+                .await
+        }
+    })).buffer_unordered(10);
+    while s.try_next().await?.is_some() { }
+
+    store.commit().await.unwrap();
 
     Ok(())
 }
@@ -200,6 +190,4 @@ pub struct RegistryConfig {
 #[serde(rename_all = "kebab-case")]
 pub struct MerkleConfig {
     pub root: String,
-    pub depth: usize,
-    pub bredth: usize,
 }

@@ -6,7 +6,7 @@ use axum::{
     routing::get,
 };
 use axum_server::tls_rustls::RustlsConfig;
-use merkletree::{MerkleStore, ReadObjectStore, fsstore::FsStore};
+use merkletree::{MerkleStore, TreeReader, fsstore::FsStore};
 use std::{
     net::SocketAddr,
     path::{self},
@@ -17,8 +17,6 @@ use std::{
 struct Data {
     store: MerkleStore<FsStore>,
     server_url: String,
-    depth: usize,
-    bredth: usize,
 }
 
 pub async fn serve(
@@ -26,15 +24,12 @@ pub async fn serve(
     port: u16,
     cert: &path::Path,
     key: &path::Path,
-    params: (usize, usize),
 ) -> anyhow::Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let server_url = format!("https://{addr}/");
     let state = Arc::new(Data {
         store,
         server_url: server_url.clone(),
-        depth: params.0,
-        bredth: params.1,
     });
 
     let app = Router::new()
@@ -44,7 +39,7 @@ pub async fn serve(
         .route("/{a}/{file_name}", get(crate_handler_short))
         .route("/{a}/{b}/{file_name}", get(crate_handler))
         .route("/merkle/tree/{file_name}", get(merkle_handler_tree))
-        .route("/merkle/data/{file_name}", get(merkle_handler_data))
+        .route("/merkle/data/{prefix}/{file_name}", get(merkle_handler_data))
         .layer(Extension(state));
 
     let config = RustlsConfig::from_pem_file(cert, key).await.unwrap();
@@ -77,16 +72,12 @@ registry = "sparse+{server_url}"
 
 async fn config_handler(Extension(store): Extension<Arc<Data>>) -> impl IntoResponse {
     let root = store.store.root().await.unwrap();
-    let depth = store.depth;
-    let bredth = store.bredth;
     format!(
         r#"
 {{
   "dl": "https://static.crates.io/crates",
   "api": "https://crates.io",
   "merkle": {{
-    "depth": {depth},
-    "bredth": {bredth},
     "root": "{root}"
   }}
 }}
@@ -116,13 +107,18 @@ async fn clear(Extension(_store): Extension<Arc<Data>>) -> impl IntoResponse {
 }
 
 async fn merkle_handler(
-    Path(hash): Path<String>,
+    hash: String,
     Extension(store): Extension<Arc<Data>>,
     is_leaf: bool,
 ) -> impl IntoResponse {
     futures_timer::Delay::new(Duration::from_millis(100)).await;
 
-    match store.store.backend().read(&hash, is_leaf).await {
+    match store
+        .store
+        .backend()
+        .read(&hash.as_str().try_into().unwrap(), is_leaf)
+        .await
+    {
         Ok(Some(data)) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "text/plain")],
@@ -137,11 +133,11 @@ async fn merkle_handler(
     }
 }
 
-async fn merkle_handler_data(hash: Path<String>, store: Extension<Arc<Data>>) -> impl IntoResponse {
-    merkle_handler(hash, store, true).await
+async fn merkle_handler_data(Path((a, b)): Path<(String, String)>, store: Extension<Arc<Data>>) -> impl IntoResponse {
+    merkle_handler(format!("{a}{b}"), store, true).await
 }
 
-async fn merkle_handler_tree(hash: Path<String>, store: Extension<Arc<Data>>) -> impl IntoResponse {
+async fn merkle_handler_tree(Path(hash): Path<String>, store: Extension<Arc<Data>>) -> impl IntoResponse {
     merkle_handler(hash, store, false).await
 }
 
