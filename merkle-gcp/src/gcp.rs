@@ -1,40 +1,24 @@
 use futures_util::StreamExt;
 use object_store::gcp::GoogleCloudStorage;
 use object_store::path::Path;
-use object_store::{
-    BackoffConfig, ObjectMeta, ObjectStore, ObjectStoreExt, Result as ObjectStoreResult,
-    RetryConfig,
-};
-use tracing::debug;
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use std::collections::HashSet;
-use std::time::Duration;
 
-use merkletree::{ContentHash, GCObjectStore, TreeReader, TreeWriter};
+use merkletree::{ContentHash, TreeEnumerator, TreeReader, TreeWriter};
 
 #[derive(Clone, Debug)]
-pub struct GcpStore {
-    inner: GoogleCloudStorage,
+pub struct GcpStore<'a> {
+    inner: &'a GoogleCloudStorage,
 }
 
-impl GcpStore {
+impl<'a> GcpStore<'a> {
     /// Build a connection from environment variables using `object_store`.
     ///
     /// Required fields in environment (or via builder config):
     /// - `GOOGLE_CLOUD_PROJECT` / service account credentials
     /// - bucket name can be set by `bucket` argument.
-    pub fn new() -> ObjectStoreResult<Self> {
-        let store = object_store::gcp::GoogleCloudStorageBuilder::from_env()
-            .with_retry(RetryConfig {
-                backoff: BackoffConfig {
-                    init_backoff: Duration::from_secs(1),
-                    max_backoff: Duration::from_secs(60),
-                    base: 2.0,
-                },
-                max_retries: 5,
-                retry_timeout: Duration::from_secs(600),
-            })
-            .build()?;
-        Ok(Self { inner: store })
+    pub fn new(store: &'a GoogleCloudStorage) -> Self {
+        Self { inner: store }
     }
 
     fn object_path(hash: &ContentHash, is_leaf: bool) -> Path {
@@ -50,10 +34,14 @@ impl GcpStore {
     }
 }
 
-impl TreeReader for GcpStore {
+impl TreeReader for GcpStore<'_> {
     type Error = object_store::Error;
 
-    async fn read(&self, hash: &ContentHash, is_leaf: bool) -> Result<Option<Vec<u8>>, Self::Error> {
+    async fn read(
+        &self,
+        hash: &ContentHash,
+        is_leaf: bool,
+    ) -> Result<Option<Vec<u8>>, Self::Error> {
         let path = Self::object_path(hash, is_leaf);
         match self.inner.get(&path).await {
             Ok(result) => {
@@ -68,8 +56,13 @@ impl TreeReader for GcpStore {
     }
 }
 
-impl TreeWriter for GcpStore {
-    async fn write(&self, hash: &ContentHash, data: Vec<u8>, is_leaf: bool) -> Result<(), Self::Error> {
+impl TreeWriter for GcpStore<'_> {
+    async fn write(
+        &self,
+        hash: &ContentHash,
+        data: Vec<u8>,
+        is_leaf: bool,
+    ) -> Result<(), Self::Error> {
         let path = Self::object_path(hash, is_leaf);
         let result = self.inner.put(&path, data.into()).await;
         if let Err(e) = &result {
@@ -78,15 +71,15 @@ impl TreeWriter for GcpStore {
         result?;
         Ok(())
     }
-}
 
-impl GCObjectStore for GcpStore {
     async fn delete(&self, hash: &ContentHash, is_leaf: bool) -> Result<(), Self::Error> {
         let path = Self::object_path(hash, is_leaf);
-        // self.inner.delete(&path).await?;
+        self.inner.delete(&path).await?;
         Ok(())
     }
+}
 
+impl TreeEnumerator for GcpStore<'_> {
     async fn enumerate_all(&self) -> Result<HashSet<(ContentHash, bool)>, Self::Error> {
         let mut all = HashSet::new();
 
@@ -106,7 +99,7 @@ impl GCObjectStore for GcpStore {
         while let Some(entry) = data_stream.next().await {
             let object_meta: ObjectMeta = entry?;
             let path = object_meta.location.as_ref();
-            
+
             if let Some(rest) = path.strip_prefix("merkle/data/") {
                 if let Some((prefix, suffix)) = rest.split_once('/') {
                     let hash = format!("{}{}", prefix, suffix);

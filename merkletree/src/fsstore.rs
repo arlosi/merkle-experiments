@@ -5,7 +5,7 @@ use std::{
 
 use tracing::trace;
 
-use crate::{GCObjectStore, TreeReader, TreeWriter, bitslice::ContentHash};
+use crate::{TreeEnumerator, TreeReader, TreeWriter, bitslice::ContentHash};
 
 pub struct FsStore {
     root: PathBuf,
@@ -59,15 +59,15 @@ impl TreeWriter for FsStore {
         }
         Ok(())
     }
-}
 
-impl GCObjectStore for FsStore {
     async fn delete(&self, hash: &ContentHash, is_leaf: bool) -> IoResult<()> {
         let path = self.object_path(&hash, is_leaf);
         std::fs::remove_file(&path)?;
         Ok(())
     }
+}
 
+impl TreeEnumerator for FsStore {
     async fn enumerate_all(&self) -> IoResult<HashSet<(ContentHash, bool)>> {
         let mut all = HashSet::new();
         let objects_dir = self.root.join(TREE);

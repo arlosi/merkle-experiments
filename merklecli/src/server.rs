@@ -6,7 +6,7 @@ use axum::{
     routing::get,
 };
 use axum_server::tls_rustls::RustlsConfig;
-use merkletree::{MerkleStore, TreeReader, fsstore::FsStore};
+use merkletree::{RwMerkleStore, TreeReader, fsstore::FsStore};
 use std::{
     net::SocketAddr,
     path::{self},
@@ -15,12 +15,12 @@ use std::{
 };
 
 struct Data {
-    store: MerkleStore<FsStore>,
+    store: RwMerkleStore<FsStore>,
     server_url: String,
 }
 
 pub async fn serve(
-    store: MerkleStore<FsStore>,
+    store: RwMerkleStore<FsStore>,
     port: u16,
     cert: &path::Path,
     key: &path::Path,
@@ -34,12 +34,14 @@ pub async fn serve(
 
     let app = Router::new()
         .route("/", get(root))
-        .route("/clear", get(clear))
         .route("/config.json", get(config_handler))
         .route("/{a}/{file_name}", get(crate_handler_short))
         .route("/{a}/{b}/{file_name}", get(crate_handler))
         .route("/merkle/tree/{file_name}", get(merkle_handler_tree))
-        .route("/merkle/data/{prefix}/{file_name}", get(merkle_handler_data))
+        .route(
+            "/merkle/data/{prefix}/{file_name}",
+            get(merkle_handler_data),
+        )
         .layer(Extension(state));
 
     let config = RustlsConfig::from_pem_file(cert, key).await.unwrap();
@@ -101,11 +103,6 @@ async fn root(Extension(store): Extension<Arc<Data>>) -> impl IntoResponse {
     ))
 }
 
-async fn clear(Extension(_store): Extension<Arc<Data>>) -> impl IntoResponse {
-    // store.store.inner().clear();
-    "cleard"
-}
-
 async fn merkle_handler(
     hash: String,
     Extension(store): Extension<Arc<Data>>,
@@ -133,11 +130,17 @@ async fn merkle_handler(
     }
 }
 
-async fn merkle_handler_data(Path((a, b)): Path<(String, String)>, store: Extension<Arc<Data>>) -> impl IntoResponse {
+async fn merkle_handler_data(
+    Path((a, b)): Path<(String, String)>,
+    store: Extension<Arc<Data>>,
+) -> impl IntoResponse {
     merkle_handler(format!("{a}{b}"), store, true).await
 }
 
-async fn merkle_handler_tree(Path(hash): Path<String>, store: Extension<Arc<Data>>) -> impl IntoResponse {
+async fn merkle_handler_tree(
+    Path(hash): Path<String>,
+    store: Extension<Arc<Data>>,
+) -> impl IntoResponse {
     merkle_handler(hash, store, false).await
 }
 

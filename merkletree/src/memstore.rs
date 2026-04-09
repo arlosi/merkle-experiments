@@ -4,7 +4,7 @@ use std::{
     sync::Mutex,
 };
 
-use crate::{GCObjectStore, TreeReader, TreeWriter, bitslice::ContentHash};
+use crate::{TreeEnumerator, TreeReader, TreeWriter, bitslice::ContentHash};
 
 pub struct MemoryStore {
     data: Mutex<HashMap<ContentHash, Vec<u8>>>,
@@ -50,15 +50,13 @@ impl TreeWriter for MemoryStore {
         is_leaf: bool,
     ) -> Result<(), Self::Error> {
         if is_leaf {
-            self.data.lock().unwrap().insert(hash.clone(), data);
+            self.data.lock().unwrap().insert(*hash, data);
         } else {
-            self.tree.lock().unwrap().insert(hash.clone(), data);
+            self.tree.lock().unwrap().insert(*hash, data);
         }
         Ok(())
     }
-}
 
-impl GCObjectStore for MemoryStore {
     async fn delete(&self, hash: &ContentHash, is_leaf: bool) -> Result<(), Self::Error> {
         if is_leaf {
             self.data.lock().unwrap().remove(hash);
@@ -67,14 +65,16 @@ impl GCObjectStore for MemoryStore {
         }
         Ok(())
     }
+}
 
+impl TreeEnumerator for MemoryStore {
     async fn enumerate_all(&self) -> Result<HashSet<(ContentHash, bool)>, Self::Error> {
         let mut result = HashSet::new();
         for k in self.tree.lock().unwrap().keys() {
-            result.insert((k.clone(), false));
+            result.insert((*k, false));
         }
         for k in self.data.lock().unwrap().keys() {
-            result.insert((k.clone(), true));
+            result.insert((*k, true));
         }
         Ok(result)
     }
@@ -82,15 +82,21 @@ impl GCObjectStore for MemoryStore {
 
 #[cfg(test)]
 mod tests {
-    use crate::MerkleStore;
+    use crate::{RwMerkleStore, TreeParameters};
 
     use super::*;
 
     #[test]
     fn test_memory_store() {
         futures::executor::block_on(async {
-            let mut store = MerkleStore::new(MemoryStore::new());
-            store.configure(None, 2, 4).await;
+            let store = RwMerkleStore::new(
+                MemoryStore::new(),
+                1,
+                TreeParameters {
+                    depth: 2,
+                    breadth: 4,
+                },
+            );
 
             for i in 0..100 {
                 store
@@ -106,6 +112,8 @@ mod tests {
                     .await
                     .unwrap();
             }
+
+            store.commit().await.unwrap();
 
             for i in 0..200 {
                 assert_eq!(

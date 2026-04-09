@@ -76,12 +76,12 @@ impl IndexNode {
     }
 
     pub fn len_bits(&self) -> u8 {
-        let bredth = self.0.len().ilog2() as u8;
-        debug_assert!(1 << (bredth as usize) == self.0.len());
-        bredth
+        let breadth = self.0.len().ilog2() as u8;
+        debug_assert!(1 << (breadth as usize) == self.0.len());
+        breadth
     }
 
-    pub fn get(&self, key: SplitNameHash) -> Option<&ContentHash> {
+    pub fn get(&self, key: NameHash) -> Option<&ContentHash> {
         let v = self.0.get(key.0 as usize).unwrap();
         if v.0 == [0; ContentHash::SIZE] {
             None
@@ -90,7 +90,7 @@ impl IndexNode {
         }
     }
 
-    pub fn insert(&mut self, key: SplitNameHash, value: ContentHash) {
+    pub fn insert(&mut self, key: NameHash, value: ContentHash) {
         self.0[key.0 as usize] = value;
     }
 
@@ -104,7 +104,7 @@ impl Debug for IndexNode {
         let mut m = f.debug_map();
         for (index, hash) in self.0.iter().enumerate() {
             if hash.0 != [0u8; 32] {
-                m.entry(&SplitNameHash(index as u32, 16), hash);
+                m.entry(&NameHash(index as u32, 16), hash);
             }
         }
         m.finish()
@@ -199,26 +199,27 @@ impl ContentHash {
     }
 }
 
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SplitNameHash(u32, u8);
+pub struct NameHash(u32, u8);
 
-impl SplitNameHash {
+impl NameHash {
     const MAX: u8 = 32;
 
-    pub fn new(value: &str, len_in_bits: u8) -> SplitNameHash {
+    pub fn new(value: &str, len_in_bits: u8) -> NameHash {
         assert!(len_in_bits <= Self::MAX);
         let bytes = Sha256::digest(value.as_bytes());
-        SplitNameHash(u32::from_le_bytes(bytes[..4].try_into().unwrap()), 32).split(len_in_bits).1
+        NameHash(u32::from_le_bytes(bytes[..4].try_into().unwrap()), 32)
+            .split(len_in_bits)
+            .1
     }
 
     /// Split the key, indexed from the right (0 is the rightmost).
-    pub fn split(self, at: u8) -> (SplitNameHash, SplitNameHash) {
+    pub fn split(self, at: u8) -> (NameHash, NameHash) {
         debug_assert!(at <= self.1);
         let x = self.0;
         let left = x.checked_shr(at as u32).unwrap_or(0);
         let right = x & ((1u64 << at) - 1) as u32;
-        (SplitNameHash(left, self.1 - at), SplitNameHash(right, at))
+        (NameHash(left, self.1 - at), NameHash(right, at))
     }
 
     pub fn is_empty(self) -> bool {
@@ -226,7 +227,7 @@ impl SplitNameHash {
     }
 }
 
-impl Debug for SplitNameHash {
+impl Debug for NameHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:0w$b}({})", self.0, self.1, w = self.1 as usize,)
     }
@@ -238,11 +239,11 @@ mod tests {
 
     #[test]
     fn basic() {
-        let (l, r) = SplitNameHash(0b1010_1100_1111_0001_0011_0101_1001_0110, 32).split(16);
+        let (l, r) = NameHash(0b1010_1100_1111_0001_0011_0101_1001_0110, 32).split(16);
         assert_eq!(l.0, 0b1010_1100_1111_0001);
         assert_eq!(r.0, 0b0011_0101_1001_0110);
 
-        let (l, r) = SplitNameHash(0b1010_1100_1111_0001_0011_0101_1001_0110, 32).split(17);
+        let (l, r) = NameHash(0b1010_1100_1111_0001_0011_0101_1001_0110, 32).split(17);
         assert_eq!(l.0, 0b1010_1100_1111_000);
         assert_eq!(r.0, 0b10011_0101_1001_0110);
     }
@@ -250,7 +251,7 @@ mod tests {
     #[test]
     fn limits() {
         let x = 0b1010_1100_1111_0001_0011_0101_1001_0110;
-        let (l, r) = SplitNameHash(x, 32).split(0);
+        let (l, r) = NameHash(x, 32).split(0);
         assert_eq!(l.0, x);
         assert_eq!(r.0, 0);
     }

@@ -2,3 +2,6 @@
 /store*
 /merkletree/target
 /merklecli/target
+/merkle-gcp/index
+cache
+index
