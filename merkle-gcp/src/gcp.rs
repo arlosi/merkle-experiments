@@ -1,4 +1,4 @@
-use futures_util::StreamExt;
+use futures::StreamExt;
 use object_store::gcp::GoogleCloudStorage;
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};

@@ -54,7 +54,15 @@ impl<B: TreeReader> TreeReader for FsCache<B> {
                 error!("{e}");
             }
         }
-        self.inner.read(hash, is_data).await
+        let result = self.inner.read(hash, is_data).await;
+        if let Ok(Some(data)) = &result {
+            let _ = std::fs::create_dir_all(path.parent().unwrap());
+            if let Err(e) = std::fs::write(&path, data) {
+                error!("{e}");
+            }
+        }
+
+        result
     }
 }
 
