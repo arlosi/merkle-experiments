@@ -1,7 +1,7 @@
 use std::{path::Path, sync::atomic::AtomicBool, thread, time::Duration};
 
 use futures::{StreamExt, TryStreamExt, stream};
-use gix::{Commit, Remote, Repository, open::Options};
+use gix::{Commit, Remote, Repository, open::Options, remote::Direction};
 use merkletree::{TreeParameters, fscache};
 use object_store::{BackoffConfig, ObjectStoreExt, RetryConfig};
 use serde::{Deserialize, Serialize};
@@ -73,8 +73,9 @@ fn main() -> anyhow::Result<()> {
         "https://github.com/rust-lang/crates.io-index",
     )?;
     let remote = repo
-        .find_default_remote(gix::remote::Direction::Fetch)
-        .unwrap()?;
+        .remote_at("https://github.com/rust-lang/crates.io-index")?
+        .with_fetch_tags(gix::remote::fetch::Tags::None)
+        .with_refspecs(["+HEAD:refs/remotes/origin/master"], Direction::Fetch)?;
 
     loop {
         println!("updating git repo...");
