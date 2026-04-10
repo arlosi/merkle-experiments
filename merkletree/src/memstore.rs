@@ -4,7 +4,7 @@ use std::{
     sync::Mutex,
 };
 
-use crate::{TreeEnumerator, TreeReader, TreeWriter, bitslice::ContentHash};
+use crate::{TreeEnumerator, TreeReader, TreeWriter, types::ContentHash};
 
 pub struct MemoryStore {
     data: Mutex<HashMap<ContentHash, Vec<u8>>>,

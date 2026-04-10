@@ -5,7 +5,7 @@ use std::{
 
 use tracing::error;
 
-use crate::{TreeEnumerator, TreeReader, TreeWriter, bitslice::ContentHash};
+use crate::{TreeEnumerator, TreeReader, TreeWriter, types::ContentHash};
 
 pub struct FsCache<B> {
     inner: B,

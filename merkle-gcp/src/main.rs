@@ -12,6 +12,7 @@ mod gcp;
 
 /*
 export GOOGLE_BUCKET=rf-tuf-cargo-merkle-experiments
+export GOOGLE_SERVICE_ACCOUNT=
 */
 
 fn main() -> anyhow::Result<()> {

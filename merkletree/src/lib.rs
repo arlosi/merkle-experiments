@@ -1,6 +1,8 @@
 pub mod fscache;
 pub mod fsstore;
 pub mod memstore;
+mod types;
+
 use futures::{
     StreamExt, TryStreamExt,
     lock::Mutex,
@@ -18,12 +20,11 @@ use std::{
 use thiserror::Error;
 use tracing::{debug, trace};
 
-use crate::bitslice::{IndexNode, LeafNode, Node};
+use crate::types::{IndexNode, LeafNode, Node};
 type MerkleResult<T, E> = std::result::Result<T, Error<E>>;
-mod bitslice;
-use bitslice::NameHash;
+use types::NameHash;
 
-pub use crate::bitslice::ContentHash;
+pub use crate::types::ContentHash;
 
 #[derive(Clone)]
 pub struct TreeParameters {
@@ -448,6 +449,10 @@ impl<B: TreeEnumerator> RwMerkleStore<B> {
 }
 
 fn compute_hash(data: &[u8]) -> ContentHash {
+    let len: u8 = (data.len().ilog2() + 1).try_into().unwrap();
+    let mut out = [0u8; 33];
+    out[0] = len;
     let output: [u8; 32] = Sha256::digest(data).into();
-    output.into()
+    out[1..].copy_from_slice(&output);
+    out.into()
 }

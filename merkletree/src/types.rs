@@ -1,12 +1,12 @@
 use std::{
-    collections::BTreeMap,
     fmt::{Debug, Display},
 };
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use hex::FromHexError;
 use sha2::{Digest as _, Sha256};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, BorshDeserialize, BorshSerialize)]
 pub enum Node {
     Index(IndexNode),
     Leaf(LeafNode),
@@ -14,65 +14,38 @@ pub enum Node {
 
 impl Node {
     pub fn serialize(&self) -> Vec<u8> {
-        match self {
-            Node::Index(index_node) => index_node.serialize(),
-            Node::Leaf(leaf_node) => leaf_node.serialize(),
-        }
+        borsh::to_vec(&self).unwrap()
     }
 
     pub fn deserialize(data: Vec<u8>) -> Self {
-        let first = data[0];
-        match first {
-            IndexNode::ID => Node::Index(IndexNode::deserialize(data)),
-            LeafNode::ID => Node::Leaf(LeafNode::deserialize(data)),
-            _ => panic!("TODO"),
-        }
+        borsh::from_slice(&data).unwrap()
     }
 
     pub fn as_leaf(&self) -> Option<&LeafNode> {
         match self {
-            Node::Index(_) => None,
             Node::Leaf(leaf_node) => Some(leaf_node),
+            _ => None,
         }
     }
 
     pub fn as_index(&self) -> Option<&IndexNode> {
         match self {
             Node::Index(index_node) => Some(index_node),
-            Node::Leaf(_) => None,
+            _ => None,
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, BorshDeserialize, BorshSerialize)]
 pub struct IndexNode(Vec<ContentHash>);
 
 impl IndexNode {
-    const ID: u8 = 0;
-
     pub fn new(nibble_width: u8) -> Self {
         assert!(nibble_width > 0);
         Self(vec![
             ContentHash([0; ContentHash::SIZE]);
             ContentHash::count(nibble_width)
         ])
-    }
-
-    pub fn deserialize(data: Vec<u8>) -> Self {
-        let chunks: Vec<_> = data[1..]
-            .chunks_exact(ContentHash::SIZE)
-            .map(|c| ContentHash(c.try_into().unwrap()))
-            .collect();
-        IndexNode(chunks)
-    }
-
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.0.len() + 1);
-        out.push(Self::ID);
-        for i in &self.0 {
-            out.extend_from_slice(&i.0);
-        }
-        out
     }
 
     pub fn len_bits(&self) -> u8 {
@@ -95,7 +68,7 @@ impl IndexNode {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &ContentHash> {
-        self.0.iter().filter(|node| node.0 != [0u8; 32])
+        self.0.iter().filter(|node| !node.is_null())
     }
 }
 
@@ -103,63 +76,44 @@ impl Debug for IndexNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut m = f.debug_map();
         for (index, hash) in self.0.iter().enumerate() {
-            if hash.0 != [0u8; 32] {
-                m.entry(&NameHash(index as u32, 16), hash);
+            if !hash.is_null() {
+                m.entry(&NameHash(index as u32, self.len_bits()), hash);
             }
         }
         m.finish()
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct LeafNode(BTreeMap<String, ContentHash>);
+#[derive(Debug, Clone, BorshDeserialize, BorshSerialize)]
+pub struct LeafNode(Vec<(String, ContentHash)>);
 
 impl LeafNode {
-    const ID: u8 = 1;
-
     pub fn new() -> Self {
-        Self(BTreeMap::new())
+        Self(Vec::new())
     }
 
     pub fn get(&self, key: &str) -> Option<&ContentHash> {
-        self.0.get(key)
+        self.0.binary_search_by_key(&key, |v|&v.0).ok().map(|v|&self.0[v].1)
     }
 
     pub fn insert(&mut self, key: String, value: ContentHash) {
-        self.0.insert(key, value);
-    }
-
-    pub fn deserialize(data: Vec<u8>) -> Self {
-        let mut out = BTreeMap::new();
-        let mut unparsed = &data[1..];
-        while let Some(i) = unparsed.iter().position(|&b| b == 0) {
-            let key = str::from_utf8(&unparsed[..i]).unwrap();
-            unparsed = &unparsed[i + 1..];
-            let value = &unparsed[..ContentHash::SIZE];
-            unparsed = &unparsed[ContentHash::SIZE..];
-            out.insert(key.to_owned(), ContentHash(value.try_into().unwrap()));
-        }
-        LeafNode(out)
-    }
-
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.0.len() * 64);
-        out.push(Self::ID);
-        for (k, v) in &self.0 {
-            out.extend_from_slice(k.as_bytes());
-            out.push(0);
-            out.extend_from_slice(&v.0);
-        }
-        out
+        let index = self.0.partition_point(|i| i.0 < key);
+        self.0.insert(index, (key, value));
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &ContentHash)> {
-        self.0.iter()
+        self.0.iter().map(|(k, v)|(k, v))
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, BorshDeserialize, BorshSerialize)]
 pub struct ContentHash([u8; ContentHash::SIZE]);
+
+impl std::hash::Hash for ContentHash {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write(&self.0[ContentHash::SIZE-size_of::<u64>()..]);
+    }
+}
 
 impl Debug for ContentHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -176,7 +130,7 @@ impl Display for ContentHash {
 }
 
 impl From<[u8; ContentHash::SIZE]> for ContentHash {
-    fn from(value: [u8; 32]) -> Self {
+    fn from(value: [u8; ContentHash::SIZE]) -> Self {
         ContentHash(value)
     }
 }
@@ -192,10 +146,22 @@ impl TryFrom<&str> for ContentHash {
 }
 
 impl ContentHash {
-    const SIZE: usize = 32;
+    const SIZE: usize = 33;
+
+    pub fn size_limit(&self) -> usize {
+        1 << self.0[0].min(usize::BITS as u8)
+    }
+
+    pub fn hash(&self) -> &[u8; 32] {
+        self.0[1..].try_into().unwrap()
+    }
 
     pub fn count(nibble_width: u8) -> usize {
         1 << nibble_width
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.0 == [0u8; Self::SIZE]
     }
 }
 
