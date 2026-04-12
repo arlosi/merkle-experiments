@@ -75,7 +75,7 @@ impl<B: TreeWriter> TreeWriter for FsCache<B> {
     ) -> Result<(), Self::Error> {
         let path = self.object_path(&hash, is_data);
         let _ = std::fs::create_dir_all(path.parent().unwrap());
-        if !path.exists() {
+        if !path.exists() && !is_data {
             if let Err(e) = std::fs::write(&path, &data) {
                 error!("{e}");
             }
