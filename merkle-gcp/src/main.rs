@@ -50,23 +50,23 @@ fn main() -> anyhow::Result<()> {
     let mut config = rt.block_on(async {
         let config: RegistryConfig =
             serde_json::from_slice(&gcp.get(&config_path).await?.bytes().await?)?;
-        let merkle = config.merkle.as_ref().unwrap();
-        println!("merkle root hash: {}", merkle.root);
-        println!("git commit: {}", merkle._corresponding_git_commit);
-        store
-            .set_root(merkle.root.as_str().try_into().unwrap())
-            .await;
-        println!("enumerating merkle tree...");
-        println!("tree contains {} nodes", store.enumerate().await?.len());
+        if let Some(merkle) = config.merkle.as_ref() {
+            println!("git commit: {}", merkle._corresponding_git_commit);
+            println!("merkle root hash: {}", merkle.root);
+            store
+                .set_root(merkle.root.as_str().try_into().unwrap())
+                .await;
+            println!("enumerating merkle tree...");
+            println!("tree contains {} nodes", store.enumerate().await?.len());
+        }
+
         anyhow::Ok(config)
     })?;
 
     let mut last_head = config
         .merkle
         .as_ref()
-        .unwrap()
-        ._corresponding_git_commit
-        .clone();
+        .map(|v|v._corresponding_git_commit.clone());
 
     println!("opening repo...");
     let repo = open_or_clone(
@@ -90,15 +90,17 @@ fn main() -> anyhow::Result<()> {
         rt.block_on(async {
             println!("inserting...");
 
-            let changes = changed_files(&repo, &last_head, &head)?;
+            let changes = changed_files(&repo, last_head.as_deref(), &head)?;
             if !changes.is_empty() {
                 println!("uploading {} changes", changes.len());
                 thread::sleep(Duration::from_secs(3));
                 let store = &store;
-                let mut changes = stream::iter(changes.into_iter().map(|path| {
+                let changes = changes.into_iter().filter_map(|path| {
+                    Some((path.clone(), path.rsplit_once('/')?.1.to_owned()))
+                });
+                let mut changes = stream::iter(changes.map(|(path, name)| {
                     let head_commit = &head_commit;
                     async move {
-                        let (_, name) = path.rsplit_once('/').unwrap();
                         if let Some(data) = read(head_commit, &path)? {
                             println!("{name}");
                             anyhow::Ok(store.put_object(&name, data).await?)
@@ -114,8 +116,8 @@ fn main() -> anyhow::Result<()> {
                 store.commit().await?;
                 let new_root = store.root().await.unwrap();
                 let x = config.merkle.as_mut().unwrap();
-                last_head = head;
-                x._corresponding_git_commit = last_head.clone();
+                last_head = Some(head.clone());
+                x._corresponding_git_commit = head.clone();
                 x.root = format!("{new_root}");
                 println!("{x:?}");
                 gcp.put(&config_path, serde_json::to_vec_pretty(&config)?.into())
@@ -159,14 +161,14 @@ fn open_or_clone(path: &Path, url: &str) -> anyhow::Result<Repository> {
     }
 }
 
-fn changed_files(repo: &Repository, a: &str, b: &str) -> anyhow::Result<Vec<String>> {
+fn changed_files(repo: &Repository, a: Option<&str>, b: &str) -> anyhow::Result<Vec<String>> {
     // Resolve commits
-    let commit_a = repo.rev_parse_single(a)?.object()?.into_commit();
-    let commit_b = repo.rev_parse_single(b)?.object()?.into_commit();
-
-    // Get trees
-    let tree_a = commit_a.tree()?;
-    let tree_b = commit_b.tree()?;
+    let tree_a = if let Some(a) = a {
+        repo.rev_parse_single(a)?.object()?.into_commit().tree()?
+    } else {
+        repo.empty_tree()
+    };
+    let tree_b = repo.rev_parse_single(b)?.object()?.into_commit().tree()?;
 
     let mut changes = Vec::new();
 

@@ -24,10 +24,7 @@ impl<'a> GcpStore<'a> {
     fn object_path(hash: &ContentHash, is_leaf: bool) -> Path {
         let hash = hash.to_string();
         if is_leaf {
-            // leaf objects are sharded like fsstore: data/{prefix2}/{rest}
-            let prefix = &hash[0..2];
-            let suffix = &hash[2..];
-            Path::from(format!("merkle/data/{}/{}", prefix, suffix))
+            Path::from(format!("merkle/data/{}", hash))
         } else {
             Path::from(format!("merkle/tree/{}", hash))
         }
