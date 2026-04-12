@@ -115,11 +115,9 @@ fn main() -> anyhow::Result<()> {
 
                 store.commit().await?;
                 let new_root = store.root().await.unwrap();
-                let x = config.merkle.as_mut().unwrap();
                 last_head = Some(head.clone());
-                x._corresponding_git_commit = head.clone();
-                x.root = format!("{new_root}");
-                println!("{x:?}");
+                config.merkle = Some(MerkleConfig { root: format!("{new_root}"), _corresponding_git_commit: head.clone() });
+                println!("{:?}", config.merkle);
                 gcp.put(&config_path, serde_json::to_vec_pretty(&config)?.into())
                     .await?;
             }
